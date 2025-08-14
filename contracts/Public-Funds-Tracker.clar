@@ -6,10 +6,14 @@
 (define-constant err-invalid-amount (err u104))
 (define-constant err-already-exists (err u105))
 (define-constant err-project-inactive (err u106))
+(define-constant err-milestone-not-found (err u107))
+(define-constant err-milestone-already-completed (err u108))
+(define-constant err-milestone-pending (err u109))
 
 (define-data-var treasury-balance uint u0)
 (define-data-var next-project-id uint u1)
 (define-data-var next-disbursement-id uint u1)
+(define-data-var next-milestone-id uint u1)
 
 (define-map projects
     uint
@@ -43,6 +47,20 @@
 (define-map authorized-auditors
     principal
     bool
+)
+
+(define-map project-milestones
+    uint
+    {
+        project-id: uint,
+        description: (string-ascii 300),
+        fund-percentage: uint,
+        target-date: uint,
+        completion-date: (optional uint),
+        status: (string-ascii 20),
+        created-by: principal,
+        verified-by: (optional principal),
+    }
 )
 
 (define-public (initialize-treasury (initial-amount uint))
@@ -184,6 +202,118 @@
     )
 )
 
+(define-public (create-milestone
+        (project-id uint)
+        (description (string-ascii 300))
+        (fund-percentage uint)
+        (target-date uint)
+    )
+    (let ((milestone-id (var-get next-milestone-id)))
+        (asserts! (is-some (map-get? projects project-id)) err-not-found)
+        (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+        (asserts! (> fund-percentage u0) err-invalid-amount)
+        (asserts! (<= fund-percentage u100) err-invalid-amount)
+        (asserts! (> target-date stacks-block-height) err-invalid-amount)
+
+        (map-set project-milestones milestone-id {
+            project-id: project-id,
+            description: description,
+            fund-percentage: fund-percentage,
+            target-date: target-date,
+            completion-date: none,
+            status: "pending",
+            created-by: tx-sender,
+            verified-by: none,
+        })
+
+        (var-set next-milestone-id (+ milestone-id u1))
+        (ok milestone-id)
+    )
+)
+
+(define-public (complete-milestone
+        (milestone-id uint)
+        (verification-note (string-ascii 200))
+    )
+    (let (
+            (milestone-data (unwrap! (map-get? project-milestones milestone-id)
+                err-milestone-not-found
+            ))
+            (project-data (unwrap! (map-get? projects (get project-id milestone-data))
+                err-not-found
+            ))
+            (manager (unwrap! (map-get? project-managers (get project-id milestone-data))
+                err-not-found
+            ))
+        )
+        (asserts!
+            (or
+                (is-eq tx-sender contract-owner)
+                (is-eq tx-sender manager)
+                (is-authorized-auditor tx-sender)
+            )
+            err-unauthorized
+        )
+        (asserts! (is-eq (get status milestone-data) "pending")
+            err-milestone-already-completed
+        )
+        (asserts! (is-eq (get status project-data) "active") err-project-inactive)
+
+        (map-set project-milestones milestone-id
+            (merge milestone-data {
+                completion-date: (some stacks-block-height),
+                status: "completed",
+                verified-by: (some tx-sender),
+            })
+        )
+        (ok true)
+    )
+)
+
+(define-public (release-milestone-funds (milestone-id uint))
+    (let (
+            (milestone-data (unwrap! (map-get? project-milestones milestone-id)
+                err-milestone-not-found
+            ))
+            (project-data (unwrap! (map-get? projects (get project-id milestone-data))
+                err-not-found
+            ))
+            (release-amount (/
+                (* (get allocated-amount project-data)
+                    (get fund-percentage milestone-data)
+                )
+                u100
+            ))
+        )
+        (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+        (asserts! (is-eq (get status milestone-data) "completed")
+            err-milestone-pending
+        )
+        (asserts! (is-eq (get status project-data) "active") err-project-inactive)
+
+        (let ((disbursement-id (var-get next-disbursement-id)))
+            (map-set disbursements disbursement-id {
+                project-id: (get project-id milestone-data),
+                amount: release-amount,
+                recipient: (unwrap!
+                    (map-get? project-managers (get project-id milestone-data))
+                    err-not-found
+                ),
+                purpose: "milestone-completion",
+                timestamp: stacks-block-height,
+                approved-by: tx-sender,
+            })
+
+            (map-set projects (get project-id milestone-data)
+                (merge project-data { spent-amount: (+ (get spent-amount project-data) release-amount) })
+            )
+
+            (var-set next-disbursement-id (+ disbursement-id u1))
+            (ok disbursement-id)
+        )
+    )
+)
+
 (define-read-only (get-treasury-balance)
     (var-get treasury-balance)
 )
@@ -228,16 +358,26 @@
 
 (define-read-only (get-total-allocated-funds)
     (fold calculate-total-allocated
-        (list u1 u2 u3 u4 u5 u6 u7 u8 u9 u10 u11 u12 u13 u14 u15 u16 u17 u18 u19
-            u20)
+        (list
+            u1             u2             u3             u4             u5
+                        u6             u7             u8             u9             u10
+                        u11             u12             u13             u14             u15
+                        u16             u17             u18             u19
+            u20
+        )
         u0
     )
 )
 
 (define-read-only (get-total-spent-funds)
     (fold calculate-total-spent
-        (list u1 u2 u3 u4 u5 u6 u7 u8 u9 u10 u11 u12 u13 u14 u15 u16 u17 u18 u19
-            u20)
+        (list
+            u1             u2             u3             u4             u5
+                        u6             u7             u8             u9             u10
+                        u11             u12             u13             u14             u15
+                        u16             u17             u18             u19
+            u20
+        )
         u0
     )
 )
@@ -272,4 +412,50 @@
 
 (define-read-only (get-contract-owner)
     contract-owner
+)
+
+(define-read-only (get-milestone (milestone-id uint))
+    (map-get? project-milestones milestone-id)
+)
+
+(define-read-only (get-project-milestone-progress (project-id uint))
+    (fold calculate-milestone-progress
+        (list u1 u2 u3 u4 u5 u6 u7 u8 u9 u10 u11 u12 u13 u14 u15 u16 u17 u18 u19
+            u20) {
+        project-id: project-id,
+        completed: u0,
+        total: u0,
+        released: u0,
+    })
+)
+
+(define-private (calculate-milestone-progress
+        (milestone-id uint)
+        (progress {
+            project-id: uint,
+            completed: uint,
+            total: uint,
+            released: uint,
+        })
+    )
+    (match (map-get? project-milestones milestone-id)
+        milestone-data (if (is-eq (get project-id milestone-data) (get project-id progress))
+            {
+                project-id: (get project-id progress),
+                completed: (if (is-eq (get status milestone-data) "completed")
+                    (+ (get completed progress) u1)
+                    (get completed progress)
+                ),
+                total: (+ (get total progress) u1),
+                released: (if (is-eq (get status milestone-data) "completed")
+                    (+ (get released progress)
+                        (get fund-percentage milestone-data)
+                    )
+                    (get released progress)
+                ),
+            }
+            progress
+        )
+        progress
+    )
 )
