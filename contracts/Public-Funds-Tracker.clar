@@ -9,11 +9,15 @@
 (define-constant err-milestone-not-found (err u107))
 (define-constant err-milestone-already-completed (err u108))
 (define-constant err-milestone-pending (err u109))
+(define-constant err-invalid-category (err u110))
+(define-constant err-expenditure-not-found (err u111))
+(define-constant err-category-limit-exceeded (err u112))
 
 (define-data-var treasury-balance uint u0)
 (define-data-var next-project-id uint u1)
 (define-data-var next-disbursement-id uint u1)
 (define-data-var next-milestone-id uint u1)
+(define-data-var next-expenditure-id uint u1)
 
 (define-map projects
     uint
@@ -60,6 +64,35 @@
         status: (string-ascii 20),
         created-by: principal,
         verified-by: (optional principal),
+    }
+)
+
+(define-map expenditure-reports
+    uint
+    {
+        project-id: uint,
+        disbursement-id: uint,
+        category: (string-ascii 50),
+        amount: uint,
+        description: (string-ascii 300),
+        vendor: (optional principal),
+        invoice-reference: (string-ascii 100),
+        reported-by: principal,
+        timestamp: uint,
+        verified: bool,
+        verified-by: (optional principal),
+    }
+)
+
+(define-map project-category-budgets
+    {
+        project-id: uint,
+        category: (string-ascii 50),
+    }
+    {
+        allocated-amount: uint,
+        spent-amount: uint,
+        limit-percentage: uint,
     }
 )
 
@@ -314,6 +347,127 @@
     )
 )
 
+(define-public (set-category-budget
+        (project-id uint)
+        (category (string-ascii 50))
+        (allocated-amount uint)
+        (limit-percentage uint)
+    )
+    (begin
+        (asserts! (is-some (map-get? projects project-id)) err-not-found)
+        (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+        (asserts! (> allocated-amount u0) err-invalid-amount)
+        (asserts! (<= limit-percentage u100) err-invalid-amount)
+        (asserts! (is-valid-category category) err-invalid-category)
+
+        (map-set project-category-budgets {
+            project-id: project-id,
+            category: category,
+        } {
+            allocated-amount: allocated-amount,
+            spent-amount: u0,
+            limit-percentage: limit-percentage,
+        })
+        (ok true)
+    )
+)
+
+(define-public (submit-expenditure-report
+        (project-id uint)
+        (disbursement-id uint)
+        (category (string-ascii 50))
+        (amount uint)
+        (description (string-ascii 300))
+        (vendor (optional principal))
+        (invoice-reference (string-ascii 100))
+    )
+    (let (
+            (expenditure-id (var-get next-expenditure-id))
+            (project-data (unwrap! (map-get? projects project-id) err-not-found))
+            (disbursement-data (unwrap! (map-get? disbursements disbursement-id) err-not-found))
+            (manager (unwrap! (map-get? project-managers project-id) err-not-found))
+            (category-budget (map-get? project-category-budgets {
+                project-id: project-id,
+                category: category,
+            }))
+        )
+        (asserts!
+            (or
+                (is-eq tx-sender contract-owner)
+                (is-eq tx-sender manager)
+            )
+            err-unauthorized
+        )
+        (asserts! (is-eq (get project-id disbursement-data) project-id)
+            err-not-found
+        )
+        (asserts! (> amount u0) err-invalid-amount)
+        (asserts! (is-valid-category category) err-invalid-category)
+        (asserts! (is-eq (get status project-data) "active") err-project-inactive)
+
+        (match category-budget
+            budget-data (let ((new-spent (+ (get spent-amount budget-data) amount)))
+                (asserts! (<= new-spent (get allocated-amount budget-data))
+                    err-category-limit-exceeded
+                )
+                (map-set project-category-budgets {
+                    project-id: project-id,
+                    category: category,
+                }
+                    (merge budget-data { spent-amount: new-spent })
+                )
+            )
+            true
+        )
+
+        (map-set expenditure-reports expenditure-id {
+            project-id: project-id,
+            disbursement-id: disbursement-id,
+            category: category,
+            amount: amount,
+            description: description,
+            vendor: vendor,
+            invoice-reference: invoice-reference,
+            reported-by: tx-sender,
+            timestamp: stacks-block-height,
+            verified: false,
+            verified-by: none,
+        })
+
+        (var-set next-expenditure-id (+ expenditure-id u1))
+        (ok expenditure-id)
+    )
+)
+
+(define-public (verify-expenditure-report (expenditure-id uint))
+    (let (
+            (expenditure-data (unwrap! (map-get? expenditure-reports expenditure-id)
+                err-expenditure-not-found
+            ))
+            (project-data (unwrap! (map-get? projects (get project-id expenditure-data))
+                err-not-found
+            ))
+        )
+        (asserts!
+            (or
+                (is-eq tx-sender contract-owner)
+                (is-authorized-auditor tx-sender)
+            )
+            err-unauthorized
+        )
+        (asserts! (not (get verified expenditure-data)) err-already-exists)
+        (asserts! (is-eq (get status project-data) "active") err-project-inactive)
+
+        (map-set expenditure-reports expenditure-id
+            (merge expenditure-data {
+                verified: true,
+                verified-by: (some tx-sender),
+            })
+        )
+        (ok true)
+    )
+)
+
 (define-read-only (get-treasury-balance)
     (var-get treasury-balance)
 )
@@ -360,9 +514,9 @@
     (fold calculate-total-allocated
         (list
             u1             u2             u3             u4             u5
-                        u6             u7             u8             u9             u10
-                        u11             u12             u13             u14             u15
-                        u16             u17             u18             u19
+            u6             u7             u8             u9             u10
+            u11             u12             u13             u14             u15
+            u16             u17             u18             u19
             u20
         )
         u0
@@ -373,9 +527,9 @@
     (fold calculate-total-spent
         (list
             u1             u2             u3             u4             u5
-                        u6             u7             u8             u9             u10
-                        u11             u12             u13             u14             u15
-                        u16             u17             u18             u19
+            u6             u7             u8             u9             u10
+            u11             u12             u13             u14             u15
+            u16             u17             u18             u19
             u20
         )
         u0
@@ -418,10 +572,59 @@
     (map-get? project-milestones milestone-id)
 )
 
+(define-read-only (get-expenditure-report (expenditure-id uint))
+    (map-get? expenditure-reports expenditure-id)
+)
+
+(define-read-only (get-category-budget
+        (project-id uint)
+        (category (string-ascii 50))
+    )
+    (map-get? project-category-budgets {
+        project-id: project-id,
+        category: category,
+    })
+)
+
+(define-read-only (get-project-category-spending
+        (project-id uint)
+        (category (string-ascii 50))
+    )
+    (match (map-get? project-category-budgets {
+        project-id: project-id,
+        category: category,
+    })
+        budget-data (some {
+            allocated: (get allocated-amount budget-data),
+            spent: (get spent-amount budget-data),
+            remaining: (- (get allocated-amount budget-data) (get spent-amount budget-data)),
+            utilization: (if (> (get allocated-amount budget-data) u0)
+                (*
+                    (/ (get spent-amount budget-data)
+                        (get allocated-amount budget-data)
+                    )
+                    u100
+                )
+                u0
+            ),
+        })
+        none
+    )
+)
+
+(define-read-only (get-expenditure-count)
+    (- (var-get next-expenditure-id) u1)
+)
+
 (define-read-only (get-project-milestone-progress (project-id uint))
     (fold calculate-milestone-progress
-        (list u1 u2 u3 u4 u5 u6 u7 u8 u9 u10 u11 u12 u13 u14 u15 u16 u17 u18 u19
-            u20) {
+        (list
+            u1             u2             u3             u4             u5
+                        u6             u7             u8             u9             u10
+                        u11             u12             u13             u14             u15
+                        u16             u17             u18             u19
+            u20
+        ) {
         project-id: project-id,
         completed: u0,
         total: u0,
@@ -457,5 +660,20 @@
             progress
         )
         progress
+    )
+)
+
+(define-private (is-valid-category (category (string-ascii 50)))
+    (or
+        (is-eq category "personnel")
+        (is-eq category "equipment")
+        (is-eq category "materials")
+        (is-eq category "services")
+        (is-eq category "transportation")
+        (is-eq category "utilities")
+        (is-eq category "maintenance")
+        (is-eq category "consulting")
+        (is-eq category "training")
+        (is-eq category "other")
     )
 )
