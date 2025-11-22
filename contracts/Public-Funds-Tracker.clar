@@ -12,12 +12,18 @@
 (define-constant err-invalid-category (err u110))
 (define-constant err-expenditure-not-found (err u111))
 (define-constant err-category-limit-exceeded (err u112))
+(define-constant err-invalid-rating (err u113))
+(define-constant err-rating-exists (err u114))
+(define-constant err-feedback-too-long (err u115))
+(define-constant err-invalid-feedback-category (err u116))
+(define-constant err-project-not-found (err u117))
 
 (define-data-var treasury-balance uint u0)
 (define-data-var next-project-id uint u1)
 (define-data-var next-disbursement-id uint u1)
 (define-data-var next-milestone-id uint u1)
 (define-data-var next-expenditure-id uint u1)
+(define-data-var next-feedback-id uint u1)
 
 (define-map projects
     uint
@@ -95,6 +101,46 @@
         limit-percentage: uint,
     }
 )
+
+;; Public Engagement System Data Structures
+
+;; Store project ratings: (project-id, citizen) -> {rating, comment, timestamp}
+(define-map project-ratings
+    {
+        project-id: uint,
+        citizen: principal,
+    }
+    {
+        rating: uint,
+        comment: (string-utf8 500),
+        timestamp: uint,
+    }
+)
+
+;; Store public feedback: feedback-id -> {project-id, citizen, text, category, timestamp}
+(define-map public-feedback
+    uint
+    {
+        project-id: uint,
+        citizen: principal,
+        feedback-text: (string-utf8 1000),
+        category: (string-ascii 50),
+        timestamp: uint,
+    }
+)
+
+;; Track citizen engagement: citizen -> {ratings-count, feedback-count, last-activity}
+(define-map citizen-engagement
+    principal
+    {
+        ratings-count: uint,
+        feedback-count: uint,
+        last-activity: uint,
+    }
+)
+
+;; Counter for feedback entries per project
+(define-map project-feedback-counter uint uint)
 
 (define-public (initialize-treasury (initial-amount uint))
     (begin
@@ -663,6 +709,95 @@
     )
 )
 
+;; Public Engagement System Functions
+
+(define-public (submit-project-rating
+        (project-id uint)
+        (rating uint)
+        (comment (string-utf8 500))
+    )
+    (let (
+            (project-data (unwrap! (map-get? projects project-id) err-project-not-found))
+            (existing-rating (map-get? project-ratings {
+                project-id: project-id,
+                citizen: tx-sender,
+            }))
+            (current-engagement (default-to {
+                ratings-count: u0,
+                feedback-count: u0,
+                last-activity: u0,
+            } (map-get? citizen-engagement tx-sender)))
+        )
+        ;; Validate rating is between 1-5
+        (asserts! (and (>= rating u1) (<= rating u5)) err-invalid-rating)
+        ;; Check if citizen has already rated this project
+        (asserts! (is-none existing-rating) err-rating-exists)
+        ;; Verify project exists and is active
+        (asserts! (is-eq (get status project-data) "active") err-project-inactive)
+
+        ;; Store the rating
+        (map-set project-ratings {
+            project-id: project-id,
+            citizen: tx-sender,
+        } {
+            rating: rating,
+            comment: comment,
+            timestamp: stacks-block-height,
+        })
+
+        ;; Update citizen engagement stats
+        (map-set citizen-engagement tx-sender {
+            ratings-count: (+ (get ratings-count current-engagement) u1),
+            feedback-count: (get feedback-count current-engagement),
+            last-activity: stacks-block-height,
+        })
+        (ok true)
+    )
+)
+
+(define-public (submit-public-feedback
+        (project-id uint)
+        (feedback-text (string-utf8 1000))
+        (category (string-ascii 50))
+    )
+    (let (
+            (project-data (unwrap! (map-get? projects project-id) err-project-not-found))
+            (feedback-id (var-get next-feedback-id))
+            (current-engagement (default-to {
+                ratings-count: u0,
+                feedback-count: u0,
+                last-activity: u0,
+            } (map-get? citizen-engagement tx-sender)))
+            (current-project-feedback-count (default-to u0 (map-get? project-feedback-counter project-id)))
+        )
+        ;; Verify project exists and is active
+        (asserts! (is-eq (get status project-data) "active") err-project-inactive)
+        ;; Validate feedback category
+        (asserts! (is-valid-feedback-category category) err-invalid-feedback-category)
+
+        ;; Store the feedback
+        (map-set public-feedback feedback-id {
+            project-id: project-id,
+            citizen: tx-sender,
+            feedback-text: feedback-text,
+            category: category,
+            timestamp: stacks-block-height,
+        })
+
+        ;; Update feedback counter
+        (var-set next-feedback-id (+ feedback-id u1))
+        (map-set project-feedback-counter project-id (+ current-project-feedback-count u1))
+
+        ;; Update citizen engagement stats
+        (map-set citizen-engagement tx-sender {
+            ratings-count: (get ratings-count current-engagement),
+            feedback-count: (+ (get feedback-count current-engagement) u1),
+            last-activity: stacks-block-height,
+        })
+        (ok feedback-id)
+    )
+)
+
 (define-private (is-valid-category (category (string-ascii 50)))
     (or
         (is-eq category "personnel")
@@ -677,3 +812,88 @@
         (is-eq category "other")
     )
 )
+
+(define-private (is-valid-feedback-category (category (string-ascii 50)))
+    (or
+        (is-eq category "general")
+        (is-eq category "progress")
+        (is-eq category "quality")
+        (is-eq category "timeline")
+        (is-eq category "budget")
+        (is-eq category "communication")
+        (is-eq category "impact")
+        (is-eq category "suggestion")
+        (is-eq category "complaint")
+        (is-eq category "praise")
+    )
+)
+
+;; Public Engagement System Read-Only Functions
+
+(define-read-only (get-project-average-rating (project-id uint))
+    ;; This is a simplified version that returns the project-id for now
+    ;; In a full implementation, this would aggregate all ratings for the project
+    (if (is-some (map-get? projects project-id))
+        (some project-id) ;; Placeholder - would calculate actual average
+        none
+    )
+)
+
+(define-read-only (get-project-feedback-summary (project-id uint))
+    (let ((feedback-count (default-to u0 (map-get? project-feedback-counter project-id))))
+        {
+            project-id: project-id,
+            total-feedback: feedback-count,
+        }
+    )
+)
+
+(define-read-only (get-citizen-engagement-stats (citizen principal))
+    (default-to {
+        ratings-count: u0,
+        feedback-count: u0,
+        last-activity: u0,
+    } (map-get? citizen-engagement citizen))
+)
+
+(define-read-only (get-project-rating-distribution (project-id uint))
+    ;; This is a simplified version that returns basic structure
+    ;; In a full implementation, this would aggregate all rating distributions
+    (if (is-some (map-get? projects project-id))
+        {
+            project-id: project-id,
+            rating-1: u0,
+            rating-2: u0,
+            rating-3: u0,
+            rating-4: u0,
+            rating-5: u0,
+        }
+        {
+            project-id: u0,
+            rating-1: u0,
+            rating-2: u0,
+            rating-3: u0,
+            rating-4: u0,
+            rating-5: u0,
+        }
+    )
+)
+
+(define-read-only (get-project-rating (project-id uint) (citizen principal))
+    (map-get? project-ratings {
+        project-id: project-id,
+        citizen: citizen,
+    })
+)
+
+(define-read-only (get-feedback-entry (feedback-id uint))
+    (map-get? public-feedback feedback-id)
+)
+
+(define-read-only (get-project-feedback-count (project-id uint))
+    (default-to u0 (map-get? project-feedback-counter project-id))
+)
+
+;; Simplified read-only functions without fold operations
+;; Note: These functions provide basic functionality that can be extended
+;; in future versions with more advanced aggregation capabilities
