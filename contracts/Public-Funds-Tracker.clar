@@ -17,8 +17,13 @@
 (define-constant err-feedback-too-long (err u115))
 (define-constant err-invalid-feedback-category (err u116))
 (define-constant err-project-not-found (err u117))
+(define-constant err-template-not-found (err u118))
+(define-constant err-template-inactive (err u119))
+(define-constant err-invalid-bps-total (err u120))
+(define-constant err-template-recipient-not-found (err u121))
 
 (define-data-var treasury-balance uint u0)
+(define-data-var next-template-id uint u1)
 (define-data-var next-project-id uint u1)
 (define-data-var next-disbursement-id uint u1)
 (define-data-var next-milestone-id uint u1)
@@ -140,7 +145,235 @@
 )
 
 ;; Counter for feedback entries per project
-(define-map project-feedback-counter uint uint)
+(define-map project-feedback-counter
+    uint
+    uint
+)
+
+(define-map allocation-templates
+    uint
+    {
+        active: bool,
+        owner: principal,
+        name: (string-ascii 48),
+        description: (string-ascii 96),
+        allocations: (list 20 {
+            recipient: principal,
+            basis-points: uint,
+        }),
+    }
+)
+
+(define-private (sum-bps-step
+        (item {
+            recipient: principal,
+            basis-points: uint,
+        })
+        (total uint)
+    )
+    (+ total (get basis-points item))
+)
+
+(define-private (sum-bps (allocations (list 20 {
+    recipient: principal,
+    basis-points: uint,
+})))
+    (fold sum-bps-step allocations u0)
+)
+
+(define-private (all-positive-bps-step
+        (item {
+            recipient: principal,
+            basis-points: uint,
+        })
+        (flag bool)
+    )
+    (and flag (> (get basis-points item) u0))
+)
+
+(define-private (all-positive-bps (allocations (list 20 {
+    recipient: principal,
+    basis-points: uint,
+})))
+    (fold all-positive-bps-step allocations true)
+)
+
+(define-private (find-bps-for-recipient-step
+        (item {
+            recipient: principal,
+            basis-points: uint,
+        })
+        (state {
+            target: principal,
+            basis-points: uint,
+            found: bool,
+        })
+    )
+    (if (get found state)
+        state
+        (if (is-eq (get recipient item) (get target state))
+            {
+                target: (get target state),
+                basis-points: (get basis-points item),
+                found: true,
+            }
+            state
+        )
+    )
+)
+
+(define-private (find-bps-for-recipient
+        (allocations (list 20 {
+            recipient: principal,
+            basis-points: uint,
+        }))
+        (recipient principal)
+    )
+    (fold find-bps-for-recipient-step allocations {
+        target: recipient,
+        basis-points: u0,
+        found: false,
+    })
+)
+
+(define-public (create-allocation-template
+        (name (string-ascii 48))
+        (description (string-ascii 96))
+        (allocations (list 20 {
+            recipient: principal,
+            basis-points: uint,
+        }))
+    )
+    (let (
+            (count (len allocations))
+            (total-bps (sum-bps allocations))
+            (valid-bps (all-positive-bps allocations))
+            (template-id (var-get next-template-id))
+        )
+        (asserts! (not (is-eq count u0)) err-invalid-bps-total)
+        (asserts! valid-bps err-invalid-bps-total)
+        (asserts! (is-eq total-bps u10000) err-invalid-bps-total)
+        (map-set allocation-templates template-id {
+            active: true,
+            owner: tx-sender,
+            name: name,
+            description: description,
+            allocations: allocations,
+        })
+        (var-set next-template-id (+ template-id u1))
+        (ok template-id)
+    )
+)
+
+(define-public (update-allocation-template
+        (template-id uint)
+        (name (string-ascii 48))
+        (description (string-ascii 96))
+        (allocations (list 20 {
+            recipient: principal,
+            basis-points: uint,
+        }))
+    )
+    (let (
+            (count (len allocations))
+            (total-bps (sum-bps allocations))
+            (valid-bps (all-positive-bps allocations))
+            (existing (map-get? allocation-templates template-id))
+        )
+        (asserts! (not (is-eq count u0)) err-invalid-bps-total)
+        (asserts! valid-bps err-invalid-bps-total)
+        (asserts! (is-eq total-bps u10000) err-invalid-bps-total)
+        (match existing
+            template-data (begin
+                (asserts! (is-eq (get owner template-data) tx-sender)
+                    err-unauthorized
+                )
+                (map-set allocation-templates template-id {
+                    active: (get active template-data),
+                    owner: (get owner template-data),
+                    name: name,
+                    description: description,
+                    allocations: allocations,
+                })
+                (ok true)
+            )
+            err-template-not-found
+        )
+    )
+)
+
+(define-public (deactivate-allocation-template (template-id uint))
+    (match (map-get? allocation-templates template-id)
+        template-data (begin
+            (asserts! (is-eq (get owner template-data) tx-sender)
+                err-unauthorized
+            )
+            (map-set allocation-templates template-id {
+                active: false,
+                owner: (get owner template-data),
+                name: (get name template-data),
+                description: (get description template-data),
+                allocations: (get allocations template-data),
+            })
+            (ok true)
+        )
+        err-template-not-found
+    )
+)
+
+(define-read-only (get-allocation-template (template-id uint))
+    (match (map-get? allocation-templates template-id)
+        template-data (ok {
+            id: template-id,
+            active: (get active template-data),
+            owner: (get owner template-data),
+            name: (get name template-data),
+            description: (get description template-data),
+            allocations: (get allocations template-data),
+        })
+        err-template-not-found
+    )
+)
+
+(define-read-only (get-allocation-template-allocations (template-id uint))
+    (match (map-get? allocation-templates template-id)
+        template-data (ok (get allocations template-data))
+        err-template-not-found
+    )
+)
+
+(define-read-only (simulate-allocation-share
+        (template-id uint)
+        (amount uint)
+        (recipient principal)
+    )
+    (match (map-get? allocation-templates template-id)
+        template-data (if (get active template-data)
+            (let ((search-result (find-bps-for-recipient (get allocations template-data) recipient)))
+                (if (get found search-result)
+                    (let (
+                            (bps (get basis-points search-result))
+                            (share (/ (* amount bps) u10000))
+                        )
+                        (ok {
+                            template-id: template-id,
+                            recipient: recipient,
+                            amount: amount,
+                            share: share,
+                        })
+                    )
+                    err-template-recipient-not-found
+                )
+            )
+            err-template-inactive
+        )
+        err-template-not-found
+    )
+)
+
+(define-read-only (get-next-allocation-template-id)
+    (var-get next-template-id)
+)
 
 (define-public (initialize-treasury (initial-amount uint))
     (begin
@@ -666,9 +899,9 @@
     (fold calculate-milestone-progress
         (list
             u1             u2             u3             u4             u5
-                        u6             u7             u8             u9             u10
-                        u11             u12             u13             u14             u15
-                        u16             u17             u18             u19
+            u6             u7             u8             u9             u10
+            u11             u12             u13             u14             u15
+            u16             u17             u18             u19
             u20
         ) {
         project-id: project-id,
@@ -726,7 +959,9 @@
                 ratings-count: u0,
                 feedback-count: u0,
                 last-activity: u0,
-            } (map-get? citizen-engagement tx-sender)))
+            }
+                (map-get? citizen-engagement tx-sender)
+            ))
         )
         ;; Validate rating is between 1-5
         (asserts! (and (>= rating u1) (<= rating u5)) err-invalid-rating)
@@ -767,13 +1002,17 @@
                 ratings-count: u0,
                 feedback-count: u0,
                 last-activity: u0,
-            } (map-get? citizen-engagement tx-sender)))
+            }
+                (map-get? citizen-engagement tx-sender)
+            ))
             (current-project-feedback-count (default-to u0 (map-get? project-feedback-counter project-id)))
         )
         ;; Verify project exists and is active
         (asserts! (is-eq (get status project-data) "active") err-project-inactive)
         ;; Validate feedback category
-        (asserts! (is-valid-feedback-category category) err-invalid-feedback-category)
+        (asserts! (is-valid-feedback-category category)
+            err-invalid-feedback-category
+        )
 
         ;; Store the feedback
         (map-set public-feedback feedback-id {
@@ -786,7 +1025,9 @@
 
         ;; Update feedback counter
         (var-set next-feedback-id (+ feedback-id u1))
-        (map-set project-feedback-counter project-id (+ current-project-feedback-count u1))
+        (map-set project-feedback-counter project-id
+            (+ current-project-feedback-count u1)
+        )
 
         ;; Update citizen engagement stats
         (map-set citizen-engagement tx-sender {
@@ -853,7 +1094,9 @@
         ratings-count: u0,
         feedback-count: u0,
         last-activity: u0,
-    } (map-get? citizen-engagement citizen))
+    }
+        (map-get? citizen-engagement citizen)
+    )
 )
 
 (define-read-only (get-project-rating-distribution (project-id uint))
@@ -879,7 +1122,10 @@
     )
 )
 
-(define-read-only (get-project-rating (project-id uint) (citizen principal))
+(define-read-only (get-project-rating
+        (project-id uint)
+        (citizen principal)
+    )
     (map-get? project-ratings {
         project-id: project-id,
         citizen: citizen,

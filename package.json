@@ -2,20 +2,17 @@
 {
   "name": "Public-Funds-Tracker-tests",
   "version": "1.0.0",
-  "description": "Run unit tests on this project.",
-  "type": "module",
   "private": true,
+  "type": "module",
   "scripts": {
     "test": "vitest run",
-    "test:report": "vitest run -- --coverage --costs",
-    "test:watch": "chokidar \"tests/**/*.ts\" \"contracts/**/*.clar\" -c \"npm run test:report\""
+    "test:watch": "vitest",
+    "test:coverage": "vitest run --coverage",
+    "check": "clarinet check"
   },
-  "author": "",
-  "license": "ISC",
   "dependencies": {
     "@hirosystems/clarinet-sdk": "^2.14.0",
     "@stacks/transactions": "^6.12.0",
-    "chokidar-cli": "^3.0.0",
     "typescript": "^5.6.0",
     "vite": "^6.1.0",
     "vitest": "^3.0.0",
